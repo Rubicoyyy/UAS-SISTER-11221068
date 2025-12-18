@@ -1,20 +1,66 @@
 services:
+  storage:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: logs
+      POSTGRES_USER: uts
+      POSTGRES_PASSWORD: uts-secret
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U uts -d logs"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+
+  broker:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - redis_data:/data
+
   aggregator:
     build: .
+    depends_on:
+      storage:
+        condition: service_healthy
+      broker:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg2://uts:uts-secret@storage:5432/logs
+      BROKER_URL: redis://broker:6379/0
+      BROKER_QUEUE_KEY: aggregator:events
+      WORKER_COUNT: 4
+      QUEUE_MAXSIZE: 20000
+      QUEUE_POLL_INTERVAL: 2
     ports:
       - "8080:8080"
-    volumes:
-      - data:/app/data
-    container_name: aggregator_service
 
   publisher:
     build:
-      context: ./publisher  # Tentukan context secara eksplisit
-    # Hapus path 'scripts/' dari command
-    command: ["python", "-u", "publisher.py", "--url", "http://aggregator:8080/publish", "--count", "5000", "--dup_ratio", "0.2", "--batch_size", "200"]
+      context: ./publisher
+    command: [
+      "python",
+      "-u",
+      "publisher.py",
+      "--url",
+      "http://aggregator:8080/publish",
+      "--count",
+      "20000",
+      "--dup_ratio",
+      "0.35",
+      "--batch_size",
+      "500"
+    ]
     depends_on:
-      - aggregator
-    container_name: publisher_service
+      aggregator:
+        condition: service_started
 
 volumes:
-  data:
+  pg_data:
+  redis_data:

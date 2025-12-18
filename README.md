@@ -1,72 +1,125 @@
-# UTS Sistem Terdistribusi - Layanan Log Aggregator
+# UAS Sistem Terdistribusi – Pub-Sub Log Aggregator
 
-Layanan ini adalah sebuah **log aggregator** berbasis FastAPI yang dirancang untuk menerima, melakukan deduplikasi, dan menyimpan *event* log secara persisten. Proyek ini dibangun untuk memenuhi tugas Ujian Tengah Semester (UTS) mata kuliah Sistem Paralel dan Terdistribusi.
+> Sistem multi-service (Python + Docker Compose) untuk mengumpulkan log secara at-least-once, melakukan deduplikasi/idempotensi persisten, dan memastikan transaksi ACID dengan kontrol konkurensi berbasis database.
 
-## ✨ Fitur Utama
+## Ringkasan Stack
 
--   **API Asinkron**: Dibangun dengan FastAPI untuk performa tinggi, menerima *event* tunggal atau *batch* melalui endpoint `POST /publish`.
--   **Deduplikasi Persisten**: Menggunakan database **SQLite** untuk memastikan setiap *event* dengan `(topic, event_id)` yang sama hanya diproses sekali, bahkan setelah layanan di-*restart*.
--   **Pemrosesan Latar Belakang**: *Event* yang masuk dimasukkan ke dalam antrian `asyncio.Queue` dan diproses oleh *worker* di latar belakang untuk menjaga responsivitas API.
--   **Orkestrasi Multi-Container**: Menggunakan **Docker Compose** untuk menjalankan layanan `aggregator` dan `publisher` secara terpisah, menunjukkan pemisahan layanan yang modular.
--   **Statistik Real-time**: Menyediakan statistik operasional sistem melalui endpoint `GET /stats`.
+- **aggregator** – FastAPI + worker async, menulis ke Postgres dengan constraint unik `(topic, event_id)` dan statistik transaksional.
+- **broker** – Redis 7 (list + BLPOP) sehingga antrean event bertahan walau aggregator restart.
+- **storage** – Postgres 16 dengan named volume `pg_data` untuk persistensi.
+- **publisher** – client Python yang memompa ≥20.000 event (±35% duplikasi) untuk demonstrasi reliabilitas.
 
----
+```
+publisher --> HTTP POST /publish --> aggregator (FastAPI)
+                                    |-> enqueue -> Redis list (broker)
+                                    |-> workers -> Postgres (storage)
+                                                   |-> unique constraint + stats
 
-## 🚀 Cara Menjalankan
+observability: /stats, structured logging, readiness via /healthz
+```
 
-### Metode 1: Menggunakan Docker Compose (Direkomendasikan + Bonus)
+## Fitur Utama
 
-Metode ini akan menjalankan layanan `aggregator` dan `publisher` secara bersamaan. *Publisher* akan secara otomatis mengirim 5000+ *event* (termasuk duplikat) untuk demonstrasi.
+- Idempotent consumer: `INSERT ... ON CONFLICT DO NOTHING` + transaksi tunggal per event menjaga konsistensi walau ada retry atau crash.
+- Dedup store persisten: Postgres berada pada volume bernama, sehingga data aman setelah container dihapus.
+- Multi-worker concurrency: jumlah worker dikendalikan env `WORKER_COUNT`, setiap worker menarik data dari Redis secara blocking.
+- Batch-aware API: `POST /publish` menerima objek tunggal maupun array, memvalidasi skema memakai Pydantic, dan menerapkan back-pressure (503) bila antrean penuh.
+- Observability: `GET /stats` menampilkan `received`, `unique_processed`, `duplicate_dropped`, daftar topic beserta jumlah event, serta `uptime_seconds` dan `worker_count`.
+- Testing 12 kasus (pytest) yang mencakup deduplikasi, race condition, validasi skema, overflow antrean, health endpoint, serta integrasi end-to-end.
 
-1.  **Build dan Jalankan Container**:
-    Dari direktori utama proyek, jalankan perintah berikut:
-    ```bash
-    docker-compose up --build
-    ```
+## Menjalankan dengan Docker Compose (disarankan)
 
-2.  **Pantau Log**: Anda akan melihat log dari kedua layanan di terminal. `publisher_service` akan menunggu 5 detik, lalu mulai mengirim *event*. `aggregator_service` akan mulai memprosesnya.
+1. **Build & start**
+   ```bash
+   docker compose up --build
+   ```
+   Compose akan memulai Postgres (`storage`), Redis (`broker`), lalu `aggregator` dan `publisher`. Publisher menunggu 5 detik sebelum mengirim batch.
+2. **Monitoring**
+   - Aggregator API: http://localhost:8080
+   - Stats: `curl http://localhost:8080/stats`
+   - Event sample: `curl "http://localhost:8080/events?topic=topic_1"`
+3. **Graceful stop** – tekan `Ctrl+C`. Volume `pg_data` dan `redis_data` menjaga data agar tetap ada jika Anda menjalankan kembali `docker compose up`.
 
-3.  **Hentikan Layanan**: Tekan `Ctrl + C` di terminal untuk menghentikan kedua layanan.
+> **Catatan jaringan:** Seluruh service berada di network default Compose tanpa akses eksternal; publisher hanya berbicara dengan aggregator melalui hostname internal.
 
----
+## Jalankan Aggregator Saja (mode dev)
 
-### Metode 2: Menjalankan Aggregator Saja (Manual)
+```
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+set DATABASE_URL=sqlite:///./data/dev.db
+python -m uvicorn src.main:app --reload
+```
 
-Gunakan metode ini jika Anda hanya ingin menjalankan layanan `aggregator` dan mengirim *request* secara manual (misalnya menggunakan `curl` atau Postman).
+SQLite disediakan untuk kemudahan pengembangan; lingkungan produksi/demo selalu menggunakan Postgres.
 
-1.  **Build Docker Image**:
-    ```bash
-    docker build -t uts-aggregator .
-    ```
+## Konfigurasi Penting
 
-2.  **Jalankan Container**:
-    Pastikan Anda sudah memiliki folder `data/` di direktori proyek.
-    ```bash
-    docker run -p 8080:8080 -v ./data:/app/data --name aggregator-uts uts-aggregator
-    ```
+| Variabel | Default | Deskripsi |
+| --- | --- | --- |
+| `DATABASE_URL` | `sqlite:///./data/dedup.db` | URL SQLAlchemy; Compose mengisinya dengan Postgres. |
+| `BROKER_URL` | `memory://local` | Gunakan `redis://broker:6379/0` agar antrean berada di Redis. |
+| `BROKER_QUEUE_KEY` | `aggregator:events` | Nama list Redis. |
+| `WORKER_COUNT` | `4` | Banyaknya worker konsumen event. |
+| `QUEUE_MAXSIZE` | `5000` | Kapasitas antrean in-memory (fallback non-Redis). |
+| `QUEUE_POLL_INTERVAL` | `2` | Timeout BLPOP / polling. |
 
----
+## API Surface
 
-## 📡 Endpoint API
+| Endpoint | Deskripsi | Contoh |
+| --- | --- | --- |
+| `POST /publish` | Terima event tunggal / batch, validasi, enqueue ke Redis/memory queue. | `curl -X POST http://localhost:8080/publish -H "Content-Type: application/json" -d "{...}"` |
+| `GET /events?topic=` | List event unik; filter opsional `topic`. | `curl http://localhost:8080/events?topic=topic_3` |
+| `GET /stats` | Statistik sistem + daftar topic + uptime. | `curl http://localhost:8080/stats` |
+| `GET /healthz` | Cek koneksi DB + siap pakai (untuk readiness). | `curl http://localhost:8080/healthz` |
 
--   **`POST /publish`**: Mengirim satu atau *batch event* JSON.
-    -   **Respons Sukses**: `202 Accepted`
-    -   **Contoh cURL**:
-        ```bash
-        # Menggunakan curl.exe di PowerShell
-        curl.exe -X POST "http://localhost:8080/publish" -H "Content-Type: application/json" -d '{\"topic\":\"demo\",\"event_id\":\"id-123\",\"timestamp\":\"2025-10-24T21:00:00Z\",\"source\":\"curl_test\",\"payload\":{\"message\":\"hello\"}}'
-        ```
+Response `POST /publish` (contoh):
 
--   **`GET /events?topic={topic_name}`**: Mengambil *event* unik yang telah diproses untuk *topic* tertentu.
-    -   **Contoh cURL**: `curl "http://localhost:8080/events?topic=demo"`
+```json
+{
+  "accepted": 500,
+  "worker_count": 4
+}
+```
 
--   **`GET /stats`**: Melihat statistik operasional.
-    -   **Contoh cURL**: `curl http://localhost:8080/stats`
+Response `GET /stats` (contoh setelah publisher mengirim 20k event dengan 35% duplikasi):
 
----
+```json
+{
+  "received": 20000,
+  "unique_processed": 13019,
+  "duplicate_dropped": 6981,
+  "topics": [{"topic": "topic_0", "count": 1305}, ...],
+  "uptime_seconds": 184.2,
+  "worker_count": 4
+}
+```
 
-## 🎥 Video Demo
+## Testing & Benchmark
 
-Berikut adalah link ke video demonstrasi sistem yang berjalan:
+1. **Unit/integration tests (12 kasus):**
+   ```bash
+   python -m pytest
+   ```
+   Suite mencakup: dedup batch, race-condition dengan ThreadPool, validasi skema, overflow antrean (mengembalikan 503), health check, serta verifikasi statistik.
 
-**[https://youtu.be/yWEU48rka2M]**
+2. **Load demo via publisher:** Jalankan Compose; `publisher` otomatis mengirim ≥20.000 event dengan 35% duplikasi. Statistik throughput bisa diambil via `GET /stats` atau script `tools/collect_stats.py`.
+
+3. **Optional k6:** Template skrip ada pada `tools/run_benchmark.ps1` untuk memicu k6 GitHub Action / lokal (tidak wajib dieksekusi pada asisten ini).
+
+## Observability & Recovery Checklist
+
+- **Log struktur**: Aggregator menulis log worker (`processed`, `duplicate`) untuk setiap event sehingga audit mudah dilakukan.
+- **Crash tolerance**: Redis menyimpan antrean dengan `appendonly yes`, Postgres memakai volume `pg_data`. Setelah `docker compose down` + `docker compose up`, `GET /events` menunjukkan state yang sama dan duplikasi tetap ditolak.
+- **Back-pressure**: Jika queue penuh, API mengembalikan 503 agar publisher dapat melakukan retry dengan exponential backoff.
+
+## Dokumen Pendukung
+
+- **Laporan teori & analisis Bab 1–13**: lihat [report.md](report.md)
+- **Script utilitas**: `tools/activate_venv.ps1`, `tools/run_benchmark.ps1`, `tools/collect_stats.py`
+- **Video demo (maks 25 menit)**: https://youtu.be/yWEU48rka2M (akan diperbarui bila ada rekaman terbaru)
+
+## Lisensi & Kontribusi
+
+Proyek ini dibuat sebagai tugas individu. Silakan gunakan referensi ini untuk studi, namun jangan menyalin kode secara literal tanpa atribusi sesuai etika akademik.

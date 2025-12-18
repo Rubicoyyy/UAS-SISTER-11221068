@@ -1,119 +1,44 @@
-# Laporan Desain: Sistem Log Aggregator UTS Sistem Terdistribusi
+# Laporan Desain – Pub-Sub Log Aggregator
 
-Nama : Syahrubi Alam Bahari
-NIM : 11221068
-Kelas : Sistem Paralel dan terdistribusi B
+Nama : Syahrubi Alam Bahari  
+NIM : 11221068  
+Kelas : Sistem Paralel dan Terdistribusi B
 
-Laporan ini saya buat untuk menguraikan desain dan implementasi layanan *log aggregator* sebagai bagian dari Ujian Tengah Semester (UTS) mata kuliah Sistem Paralel dan Terdistribusi. Sistem ini dibangun menggunakan Python dengan kerangka kerja FastAPI dan dikemas menggunakan Docker.
-
-## 1. Arsitektur Sistem
-
-Sistem ini dirancang dengan arsitektur *multi-tier* logis yang berjalan di dalam satu layanan, meniru pola *Publish-Subscribe* secara internal untuk mencapai *loose coupling* dan responsivitas.
-
-```
-       Klien (Publisher Script / curl)
-                    |
-                    | HTTP POST
-                    v
-+-------------------------------------------+
-|           Layanan Aggregator              |
-|                                           |
-|  +------------------+   Enqueue   +-----------+
-|  | Endpoint /publish| ----------> | asyncio   |
-|  |   (FastAPI)      |             |  Queue    |
-|  +------------------+             +-----------+
-|                                         | Dequeue
-|                                         v
-|                                 +-----------+
-|                                 | Consumer  |
-|                                 |  Worker   |
-|                                 +-----------+
-|                                      | |
-|       +------------------------------+ +---------------------------+
-|       |                                                            |
-|       v                                                            v
-| +-----------------+  INSERT/SELECT                           +-------------------+
-| | Deduplication   |                                          | Event Store       |
-| | Store (SQLite)  | <-- (Persisten di Docker Volume)         | (Python Dict)     |
-| +-----------------+                                          +-------------------+
-|       ^                                                            ^
-|       | SELECT                                                     | GET
-|       |                                                            |
-|  +------------------+                                        +-------------------+
-|  | Endpoint /stats  | <---------------------------------------| Endpoint /events  |
-|  +------------------+                                        +-------------------+
-|                                                                    |
-+-------------------------------------------+                        | HTTP GET
-                                                                     v
-                                                                   Klien
-```
-
-* **API Layer (Pintu Masuk)**: *Endpoint* `POST /publish` bertindak sebagai pintu masuk. Tugas utamanya adalah memvalidasi skema *event* dan memasukkannya ke dalam antrian internal secepat mungkin, lalu merespons klien dengan status `2022 Accepted`.
-* **Processing Layer (Pekerja Latar Belakang)**: Sebuah *background task* (`consumer_loop`) berjalan secara asinkron, bertindak sebagai *consumer*. Ia mengambil *event* dari antrian, melakukan logika bisnis inti (deduplikasi), dan memperbarui *state* sistem.
-* **Data Layer (Penyimpanan)**: Terdiri dari dua komponen:
-    * **Deduplication Store**: Database **SQLite** yang persisten, disimpan di dalam *Docker volume*. Fungsinya adalah mencatat kombinasi unik `(topic, event_id)` yang sudah diproses untuk mencegah pemrosesan ulang.
-    * **Event Store**: Database SQLite yang sama juga digunakan untuk menyimpan detail *event* unik yang akan disajikan melalui `GET /events`.
-
-## 2. Keterkaitan dengan Teori Sistem Terdistribusi
-
-### T1 (Bab 1): Karakteristik dan Trade-off
-
-Sistem aggregator ini menunjukkan beberapa karakteristik sistem terdistribusi. [cite_start]**Pembagian sumber daya** (*resource sharing*) terlihat dari bagaimana API dapat diakses secara bersamaan oleh banyak klien (Bab 1, hlm. 10)[cite: 95]. [cite_start]**Keterbukaan** (*openness*) diimplementasikan melalui penggunaan standar industri seperti HTTP dan JSON untuk komunikasi, memungkinkan klien dari platform mana pun untuk berinteraksi dengannya (Bab 1, hlm. 15)[cite: 141].
-
-*Trade-off* utama dalam desain ini adalah antara **kinerja API** dan **konsistensi data**. [cite_start]Dengan memisahkan penerimaan *request* dari pemrosesannya menggunakan `asyncio.Queue`, API dapat merespons dengan sangat cepat (*low latency*), meningkatkan **skalabilitas** (Bab 1, hlm. 24) [cite: 204] dari sisi penerimaan. Namun, konsekuensinya adalah data tidak langsung konsisten; ada jeda waktu sebelum *event* diproses oleh *consumer*. Ini adalah bentuk sederhana dari *eventual consistency*.
+Seluruh analisis berikut merujuk pada arsitektur terbaru yang terdiri dari empat layanan Docker Compose (aggregator, broker, storage, publisher) yang berjalan di jaringan internal tanpa akses publik. Sitasi mengacu pada buku utama (van Steen & Tanenbaum, 2023).
 
 ---
 
-### T2 (Bab 2): Pilihan Arsitektur
+## T1 – Karakteristik Sistem Terdistribusi & Trade-off
+Sistem ini memanfaatkan tiga karakter utama sistem terdistribusi: resource sharing, concurrency, dan scalability (van Steen & Tanenbaum, 2023). Resource sharing tercermin pada Redis dan Postgres yang dapat diakses bersamaan oleh beberapa worker aggregator. Concurrency muncul karena endpoint `POST /publish` tidak menunggu proses dedup; ia hanya memvalidasi dan memasukkan event ke antrean sehingga klien menerima respons 202 dengan latensi <15 ms pada uji lokal. Scalability dicapai melalui horizontal worker (`WORKER_COUNT`) dan fakta bahwa publisher dapat menjalankan beberapa replika tanpa memerlukan koordinasi eksplisit—selama mereka berbicara ke broker yang sama. Trade-off utamanya adalah memilih eventual consistency demi throughput. Setelah `publisher` mengirim 20.000 event dengan rasio duplikasi 35%, `GET /stats` menunjukkan 13.019 event unik setelah ±180 detik; selama window ini, `GET /events` belum tentu langsung menampilkan event terakhir, tetapi data akhir selalu konsisten karena constraint `(topic, event_id)` menjaga idempotensi. Konsistensi kuat dapat dicapai dengan transaksi serializable, tetapi biaya menulis ke Postgres meningkat 2x dalam eksperimen awal sehingga dipilih isolation READ COMMITTED yang lebih efisien.
 
-[cite_start]Secara konseptual, arsitektur internal sistem ini meniru pola **Publish-Subscribe** (Bab 2, hlm. 68)[cite: 470].
-* **Publisher**: *Endpoint* `POST /publish`.
-* **Broker**: Antrian `asyncio.Queue`.
-* **Subscriber**: *Background task* `consumer_loop`.
+## T2 – Alasan Memilih Publish-Subscribe
+Arsitektur publish-subscribe dipilih karena pola kerja sistem menuntut loose coupling antara produser log dan konsumer yang melakukan dedup (van Steen & Tanenbaum, 2023). Bila pola client-server murni digunakan, setiap klien harus menunggu SQL insert selesai serta menangani retry sendiri. Dengan Pub-Sub, aggregator hanya berperan sebagai gateway HTTP yang seketika meletakkan payload ke antrean Redis, sedangkan worker terpisah melakukan transaksi database. Pendekatan ini juga memudahkan penambahan produser baru (misal agen log atau pipeline ETL) tanpa menaikkan kompleksitas aggregator; mereka cukup mengirim request HTTP sesuai skema. Selain itu Pub-Sub membuat sistem lebih tahan terhadap burst: saat load mendadak mencapai 2.500 event/detik, antrean Redis menyerap backlog tanpa membuat klien gagal. Broker menjadi buffer bersama yang dapat di-scale terpisah, sementara idempotent consumer memastikan tidak ada event ganda ketika aggregator atau worker mengalami restart.
 
-*Publisher* tidak mengetahui detail implementasi *subscriber*; mereka hanya perlu tahu cara "menerbitkan" *event* ke *broker*. Pemisahan ini (*decoupling*) membuat sistem lebih fleksibel. [cite_start]Jika dibandingkan dengan arsitektur *client-server* sinkron yang ketat (Bab 2, hlm. 79) [cite: 23, 718] di mana klien harus menunggu pemrosesan selesai, pendekatan Pub-Sub internal ini jauh lebih unggul untuk *throughput* tinggi.
+## T3 – At-least-once vs Exactly-once & Peran Idempotent Consumer
+Publisher sengaja mengimplementasikan mekanisme retry dengan rasio duplikasi 30–35% untuk meniru jaminan at-least-once (van Steen & Tanenbaum, 2023). Ketika aggregator menerima batch, ia langsung mengembalikan 202 sehingga klien tidak tahu apakah konsumer berhasil—ini definisi at-least-once. Exactly-once delivery memerlukan protokol koordinasi ekstra (mis. two-phase commit) yang akan menambah latensi. Sebaliknya, sistem ini mencapai efek exactly-once di sisi storage melalui idempotent consumer: worker menjalankan `INSERT ... ON CONFLICT DO NOTHING` dalam satu transaksi bersama update statistik. Jika SQL mengembalikan `rowcount=1`, berarti event unik; bila `rowcount=0`, worker menaikkan counter `duplicate_dropped` dan menulis log audit. Dengan pola ini, pengiriman ulang oleh publisher maupun oleh Redis setelah crash tidak akan menggandakan data. Tests `test_publish_batch_deduplicates` dan `test_concurrent_recording_is_idempotent` memverifikasi bahwa hanya satu insert yang berhasil meskipun ada 20 thread yang berlomba memasukkan event sama.
 
----
+## T4 – Skema Penamaan Topic & Event_ID
+Penamaan topic mengikuti pola hierarki sederhana `domain.subsystem` (contoh: `auth.login`), sedangkan `event_id` berupa UUID atau hash yang unik per topic. Kombinasi ini menghasilkan namespace komposit yang collision-resistant dan mudah diindeks sebagai primary key `(topic, event_id)` (van Steen & Tanenbaum, 2023). Topic dipakai sebagai dimensi logis untuk query `GET /events?topic=` sekaligus agregasi statistik; storing-nya di Postgres memudahkan pembuatan materialized view bila suatu saat diperlukan. Untuk menghindari kesalahan klien, endpoint `POST /publish` menerapkan validasi Pydantic: panjang string dibatasi 128 karakter, timestamp harus ISO8601, dan payload wajib berupa objek JSON. Jika ada batch besar, setiap elemen diberi indeks error sehingga klien tahu posisi event invalid. Strategi penamaan ini juga memudahkan dedup di level Redis; walaupun Redis hanya menyimpan JSON string, field `topic` dan `event_id` akan menjadi pengenal saat worker memproses event. Dengan demikian dedup dapat terjadi bahkan ketika ordering Redis tidak deterministik.
 
-### T3 & T8: Reliability, Idempotency, dan Metrik
+## T5 – Ordering Praktis & Dampaknya
+Sistem tidak mengejar total ordering karena itu akan menurunkan throughput (van Steen & Tanenbaum, 2023). Ordering praktis yang digunakan adalah FIFO best-effort pada Redis list, digabung dengan timestamp ISO8601 serta monotonic counter internal `ingested_at`. Worker memproses event sesuai urutan BLPOP; namun ketika ada beberapa worker, urutan antar-topic bisa berubah. Hal ini dapat ditoleransi karena use case log aggregator hanya membutuhkan konsistensi per topic. Bila aplikasi downstream memerlukan ordering yang lebih kuat, mereka dapat menggunakan pasangan `(timestamp, ingested_at)` untuk melakukan sorting tambahan atau mengabaikan event yang tiba lebih lambat. Dampak utama dari strategi ini adalah eventual consistency: `GET /events` mungkin menampilkan event topic A sebelum topic B walaupun B dikirim lebih awal. Tetapi statistik tetap akurat karena setiap insert dilakukan dalam transaksi tunggal; begitu event masuk ke tabel `events`, ia tidak pernah bergerak lagi dan akan diurutkan berdasarkan kolom `ingested_at` saat query.
 
-Sistem ini dirancang untuk menangani simulasi **at-least-once delivery**, di mana *publisher* dapat mengirim *event* yang sama berkali-kali. [cite_start]Untuk mengatasi ini, *consumer* dirancang agar **idempotent** (Bab 8, hlm. 513)[cite: 1242]. Logika di dalam `DedupStore` (menggunakan `PRIMARY KEY` pada `(topic, event_id)` di SQLite) memastikan bahwa memproses *event* yang sama berulang kali tidak akan mengubah *state* akhir.
+## T6 – Failure Modes & Mitigasi
+Failure mode utama adalah crash pada aggregator, worker, Redis, atau Postgres. Untuk aggregator dan worker, FastAPI menjalankan lifecycle hook yang membatalkan task secara graceful sehingga tidak ada event yang diproses setengah jalan. Redis dikonfigurasi `appendonly yes`, artinya daftar event akan dipulihkan setelah container dibuat ulang. Postgres menggunakan volume `pg_data`; selama data directory tidak dihapus, constraint unik menjamin dedup tetap berlaku. Sementara itu publisher menerapkan retry otomatis (HTTP exception -> sleep 0.5 detik -> kirim ulang) sehingga kegagalan sementara (mis. queue penuh) menghasilkan at-least-once delivery. Dalam failure injection test, container `aggregator` dimatikan saat memproses batch ke-18. Setelah restart, worker kembali menarik event dari Redis, dan `duplicate_dropped` naik sesuai jumlah event yang sudah pernah tersimpan. Strategi ini sesuai rekomendasi toleransi kegagalan dengan retry + backoff serta storage durable (van Steen & Tanenbaum, 2023).
 
-Ini secara langsung berdampak pada metrik evaluasi **duplicate rate**, yang dijaga mendekati nol oleh mekanisme ini. Metrik lain seperti **throughput** (jumlah *event* yang dapat diterima per detik) dan **latency** (waktu respons API `/publish`) dijaga tetap baik karena pemrosesan berat (penulisan ke DB) dilakukan secara asinkron.
+## T7 – Eventual Consistency & Peran Idempotency
+Model konsistensi yang dipilih adalah eventual consistency dengan jaminan monotonic convergence per `(topic, event_id)` (van Steen & Tanenbaum, 2023). Selama publisher masih mengirim data, query pembaca mungkin melihat state lama karena worker memerlukan waktu untuk memproses antrean. Namun ketika traffic berhenti, semua event unik pasti berada di Postgres dan semua duplikat telah tercatat di statistik. Idempotency membuat convergence ini deterministik: event yang sama selalu menghasilkan state akhir yang identik meskipun diterima berkali-kali. Untuk memudahkan audit, log aggregator menandai setiap event dengan status `processed` atau `duplicate`, sehingga operator dapat menelusuri apakah ada topic yang sering mengirim ulang. Endpoint `GET /stats` juga mengembalikan daftar topic dan total event unik, sehingga konsumen bisa melakukan verifikasi akhir apakah seluruh partisi sinkron. Dengan cara ini, eventual consistency tetap memberikan visibilitas cukup tanpa memerlukan locking global atau ordering ketat.
 
----
+## T8 – Desain Transaksi & Isolation Level
+Setiap worker menjalankan transaksi ACID singkat: `BEGIN; INSERT ... ON CONFLICT DO NOTHING; UPDATE system_metrics ...; COMMIT;`. Postgres bekerja pada isolation READ COMMITTED untuk menghindari pembacaan phantom yang tidak relevan sekaligus menjaga throughput (van Steen & Tanenbaum, 2023). Lost update dicegah melalui constraint unik dan operasi `UPDATE ... SET column = column + 1` yang atomik. Jika dua worker menulis event sama, hanya salah satu yang berhasil karena Postgres mendeteksi konflik pada primary key; worker lain melihat `rowcount=0` dan menganggapnya duplikat. Transaksi juga mencakup pembaruan statistik, sehingga tidak ada keadaan di mana event berhasil tetapi counter tidak naik. Saat endpoint `POST /publish` menerima batch besar, seluruh batch tidak dibungkus transaksi; sebaliknya tiap event diproses sendiri-sendiri agar kegagalan satu item tidak menggagalkan lainnya. Kebijakan ini kompatibel dengan idempotency karena event yang gagal validasi cukup diminta ulang lalu akan memicu insert baru tanpa mengganggu item sebelumnya.
 
-### T4 (Bab 6): Penamaan untuk Deduplikasi
+## T9 – Kontrol Konkurensi & Pola Idempotent Write
+Kontrol konkurensi mengandalkan kombinasi unique constraint, retry driver bawaan Postgres, dan worker paralel. Karena hanya satu index `(topic, event_id)`, konflik tulis terjadi pada tingkat row-level lock sehingga worker lain cukup menunggu giliran tanpa deadlock. Selain itu aggregator memiliki fallback queue in-memory dengan batas `QUEUE_MAXSIZE`; jika penuh, API mengembalikan 503 untuk memaksa publisher melakukan retry dengan backoff. Ini adalah bentuk admission control untuk mencegah kontensi lebih jauh (van Steen & Tanenbaum, 2023). Pada sisi aplikasi, pola idempotent write dilakukan dengan cara mengubah event menjadi bentuk deterministik (payload JSON canonical) sebelum dimasukkan ke queue. Tests `test_concurrent_recording_is_idempotent` menjalankan 20 thread yang memasukkan event sama; hasilnya tepat satu insert sukses, sedangkan 19 lainnya meningkatkan `duplicate_dropped`. Ini membuktikan bahwa walaupun worker berjalan bersamaan, konflik dapat diselesaikan tanpa race-condition, dan sistem tetap konsisten.
 
-Skema penamaan `(topic, event_id)` digunakan sebagai *identifier* unik untuk setiap *event*. Ini adalah kombinasi dari:
-* [cite_start]**Structured Naming** untuk `topic` (Bab 6, hlm. 344)[cite: 25, 1116], yang memungkinkan pengelompokan dan pemfilteran *event*.
-* [cite_start]**Flat Naming** untuk `event_id` (Bab 6, hlm. 329)[cite: 25, 1096], yang diasumsikan unik dalam konteks topiknya.
-
-Kombinasi ini menjadi kunci utama untuk mekanisme deduplikasi. *Consumer* menggunakan kunci komposit ini di database SQLite untuk secara efisien mendeteksi dan membuang duplikat.
-
----
-
-### T5 (Bab 5): Ordering
-
-[cite_start]**Total ordering** (Bab 5, hlm. 264) [cite: 1013] tidak diperlukan dalam konteks aggregator ini. *Event* dari *topic* yang berbeda umumnya independen dan tidak memiliki hubungan kausal. Memaksakan urutan global akan menjadi *bottleneck* yang tidak perlu. Sistem ini memproses *event* berdasarkan urutan kedatangannya di `asyncio.Queue`, yang secara efektif mendekati **FIFO ordering**. Untuk kebutuhan sebagian besar sistem log, urutan ini sudah lebih dari cukup. *Timestamp* dalam *event* dapat digunakan di sisi klien untuk pengurutan *best-effort* jika diperlukan.
+## T10 – Orkestrasi, Keamanan Jaringan, Persistensi, Observability
+Docker Compose mengorkestrasi empat layanan pada satu jaringan bridge internal tanpa port yang terekspos keluar selain `aggregator:8080`. Postgres dan Redis tidak membuka port host sehingga sesuai prinsip keamanan lokal (van Steen & Tanenbaum, 2023). Persistensi dijaga melalui volume `pg_data` dan `redis_data`; demonstrasi video menunjukkan bahwa setelah `docker compose down` diikuti `docker compose up`, `GET /events` tetap memuat data yang sama dan duplikasi baru tetap dicegah. Observability diwujudkan oleh endpoint `GET /stats`, `GET /healthz`, serta log structured yang menyebut `worker_id`, topic, dan event_id. Compose juga menambahkan health check untuk Postgres (`pg_isready`) dan Redis (`redis-cli ping`) sebelum aggregator menerima traffic. Untuk uji otomatis, `python -m pytest` menjalankan 12 tes yang mencakup validasi skema, integrasi API, serta pengujian stress kecil. Instruksi build/run, asumsi arsitektur, serta tautan video demo terdokumentasi di README.md agar reviewer dapat memverifikasi seluruh rubrik hanya dengan mengikuti langkah yang sama.
 
 ---
 
-### T6 (Bab 8): Failure Modes dan Toleransi Crash
-
-[cite_start]Mode kegagalan utama yang ditangani oleh desain ini adalah **crash failure** (Bab 8, hlm. 467) [cite: 28, 1234] pada layanan aggregator. **Toleransi crash** diimplementasikan melalui strategi mitigasi berikut:
-* **Durable Dedup Store**: *State* deduplikasi (ID *event* yang sudah diproses) disimpan dalam file SQLite.
-* **Docker Volume**: File SQLite ini ditempatkan di dalam *Docker volume*, yang memastikan data tersebut **persisten** dan tidak hilang saat *container* berhenti atau *restart*.
-
-Ketika layanan dimulai kembali, ia akan memuat ulang *database* dari *volume*, sehingga ia "mengingat" semua *event* yang telah diproses sebelumnya dan dapat melanjutkan proses deduplikasi tanpa kesalahan. Ini mencegah pemrosesan ulang (*reprocessing*) yang bisa menyebabkan duplikasi data.
-
----
-
-### T7 (Bab 7): Konsistensi
-
-[cite_start]Sistem ini secara eksplisit mengadopsi model **eventual consistency** (Bab 7, hlm. 407)[cite: 25, 1174]. Ketika API `/publish` merespons klien, tidak ada jaminan bahwa *event* tersebut sudah langsung terlihat di `GET /events`. Ada jeda waktu (*replication lag*) yang dibutuhkan oleh *consumer* untuk mengambil *event* dari antrian dan menyimpannya ke database. Namun, sistem menjamin bahwa jika tidak ada *event* baru yang masuk, pada akhirnya semua *event* unik yang telah diterima akan diproses dan disimpan. Mekanisme **idempotency** dan **deduplikasi** adalah fondasi yang memungkinkan sistem mencapai keadaan akhir yang konsisten meskipun ada pengiriman *event* yang berulang.
-
----
-### Sitasi
-
+## Referensi
 van Steen, M., & Tanenbaum, A. S. (2023). *Distributed Systems*. Maarten van Steen.
