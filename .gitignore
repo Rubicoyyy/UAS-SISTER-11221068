@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # Python
 __pycache__/
 *.py[cod]
@@ -25,31 +24,3 @@ data/
 build/
 dist/
 *.egg-info/
-=======
-# Python
-__pycache__/
-*.py[cod]
-*.so
-
-# Virtual environments
-.venv/
-venv/
-
-# SQLite DB
-data/
-
-# Editor directories
-.vscode/
-.idea/
-
-# OS files
-.DS_Store
-
-# Byte-compiled / optimized / DLL files
-*.pyc
-
-# Distribution / packaging
-build/
-dist/
-*.egg-info/
->>>>>>> e4351704fe02966e0cd5fc5b126a3a6392a5e648
